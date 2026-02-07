@@ -1,0 +1,11 @@
+[project]
+name = "wildlife-app"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.128.3",
+    "opencv-python>=4.13.0.92",
+    "ultralytics>=8.4.12",
+]
