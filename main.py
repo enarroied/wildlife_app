@@ -41,37 +41,41 @@ async def camera(url: str):
         cap.release()
 
 
-# TODO: Clean this function separate concerns
-async def camera_reader(urls: list[str]):
-    """Reads frames from cameras and broadcasts to all consumers"""
+async def _put_frame_nonblocking(queue: asyncio.Queue, frame):
+    """Put frame in queue, dropping oldest frame if full."""
+    if queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+    await queue.put(frame.copy())
 
+
+async def _distribute_frame(frame):
+    """Send frame to all consumers (detector and streaming clients)."""
+    await _put_frame_nonblocking(frame_queue, frame)
+    await _put_frame_nonblocking(broadcast_queue, frame)
+
+
+async def _read_camera_stream(cap):
+    """Read frames from an open camera capture."""
+    while cap.isOpened():
+        success, frame = cap.read()
+
+        if not success:
+            break
+
+        await _distribute_frame(frame)
+        await asyncio.sleep(0)
+
+
+async def read_camera(urls: list[str]):
+    """Continuously read frames from camera sources and distribute to consumers."""
     while True:
         url = random.choice(urls)
 
         async with camera(url) as cap:
-            while cap.isOpened():
-                success, frame = cap.read()
-
-                if not success:
-                    break
-
-                # Put in frame_queue for detector
-                if frame_queue.full():
-                    try:
-                        frame_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                await frame_queue.put(frame.copy())
-
-                # Broadcast to all streaming clients
-                if broadcast_queue.full():
-                    try:
-                        broadcast_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                await broadcast_queue.put(frame.copy())
-
-                await asyncio.sleep(0)
+            await _read_camera_stream(cap)
 
 
 def _save_snapshot(frame):
@@ -175,7 +179,7 @@ async def frame_generator():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    camera_task = asyncio.create_task(camera_reader(URLS))
+    camera_task = asyncio.create_task(read_camera(URLS))
     detector_task = asyncio.create_task(detect_bear())
     yield
     camera_task.cancel()
