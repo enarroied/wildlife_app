@@ -18,6 +18,7 @@ SNAPSHOTS_DIR = Path("snapshots")
 COOLDOWN_PERIOD = timedelta(seconds=60)
 model_dir = "model/yolo11n_openvino_model/"
 model = YOLO(model_dir, task="detect")
+DETECTION_INTERVAL = 3  # Process every 3rd frame (10 FPS)
 
 # Cooldown state
 alert_active = False
@@ -82,54 +83,79 @@ def _save_snapshot(frame):
     return filename
 
 
-# TODO: clean this function separate concerns
-# TODO: simplify logical and excessive indentation
-async def bear_detector():
-    """Runs detection in background, saves snapshots when bears detected"""
+# Refactored helper functions
+def _detect_bears(frame) -> bool:
+    """Run YOLO detection and return True if bear found."""
+    results = model(frame, stream=True, conf=0.25)
+
+    for r in results:
+        for box in r.boxes:
+            class_id = int(box.cls[0])
+            class_name = model.names[class_id]
+            if class_name.lower() == "bear":
+                return True
+
+    return False
+
+
+def _should_trigger_alert() -> bool:
+    """Check if cooldown allows new alert."""
+    return not alert_active
+
+
+def _trigger_bear_alert(frame):
+    """Save snapshot and push Hatchet event."""
     global alert_active, last_alert_time
+
+    snapshot_path = _save_snapshot(frame)
+
+    hatchet.event.push(  # TODO: Add metadata, maybe other animals
+        "bear:detected",
+        {
+            "snapshot_path": str(snapshot_path),
+            "timestamp": datetime.now().isoformat(),
+        },
+    )
+
+    alert_active = True
+    last_alert_time = datetime.now()
+
+
+def _reset_cooldown_if_needed(bear_found: bool):
+    """Reset alert cooldown when appropriate."""
+    global alert_active
+
+    if bear_found:
+        return
+
+    if not last_alert_time:
+        alert_active = False
+        return
+
+    time_since_alert = datetime.now() - last_alert_time
+    if time_since_alert > COOLDOWN_PERIOD:
+        alert_active = False
+
+
+async def detect_bear():
+    """Run detection loop with frame skipping optimization."""
+    frame_counter = 0
 
     while True:
         frame = await frame_queue.get()
+        frame_counter += 1
 
-        results = model(frame, stream=True, conf=0.25)
-        bear_found = False
+        # Only detect every 3rd frame (10 FPS optimization)
+        if frame_counter % DETECTION_INTERVAL != 0:
+            await asyncio.sleep(0)
+            continue
 
-        for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                class_id = int(box.cls[0])
-                class_name = model.names[class_id]
+        bear_found = _detect_bears(frame)
 
-                if class_name.lower() == "bear":
-                    bear_found = True
+        if bear_found and _should_trigger_alert():
+            _trigger_bear_alert(frame)
 
-                    # Only alert if cooldown is inactive
-                    if not alert_active:
-                        snapshot_path = _save_snapshot(frame)
-
-                        ############### Hatchet Event here ################
-                        hatchet.event.push(
-                            "bear:detected",
-                            {
-                                "snapshot_path": str(snapshot_path),
-                                "timestamp": datetime.now().isoformat(),
-                                # TODO: Add metadata, maybe other animals
-                            },
-                        )
-
-                        alert_active = True
-                        last_alert_time = datetime.now()
-
-                    break  # Only process once per frame
-
-        # Reset cooldown if no bear OR timeout expired
-        if not bear_found:
-            # Only reset cooldown if enough time has passed OR we never alerted
-            if (
-                not last_alert_time
-                or datetime.now() - last_alert_time > COOLDOWN_PERIOD
-            ):
-                alert_active = False
+        _reset_cooldown_if_needed(bear_found)
 
         await asyncio.sleep(0)
 
@@ -150,7 +176,7 @@ async def frame_generator():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     camera_task = asyncio.create_task(camera_reader(URLS))
-    detector_task = asyncio.create_task(bear_detector())
+    detector_task = asyncio.create_task(detect_bear())
     yield
     camera_task.cancel()
     detector_task.cancel()
