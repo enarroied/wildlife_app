@@ -6,7 +6,7 @@ from pathlib import Path
 
 import cv2
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from hatchet_client import hatchet
 from ultralytics import YOLO
 
@@ -20,9 +20,12 @@ model_dir = "model/yolo11n_openvino_model/"
 model = YOLO(model_dir, task="detect")
 DETECTION_INTERVAL = 3  # Process every 3rd frame (10 FPS)
 
+
 # Cooldown state
 alert_active = False
 last_alert_time = None
+last_detection_time = None
+
 
 # TODO: Separate the streaming simulation, add more videos, remove global variable
 URLS = [
@@ -52,9 +55,10 @@ async def _put_frame_nonblocking(queue: asyncio.Queue, frame):
 
 
 async def _distribute_frame(frame):
-    """Send frame to all consumers (detector and streaming clients)."""
-    await _put_frame_nonblocking(frame_queue, frame)
-    await _put_frame_nonblocking(broadcast_queue, frame)
+    resized = cv2.resize(frame, (640, 480))
+
+    await _put_frame_nonblocking(frame_queue, resized)
+    await _put_frame_nonblocking(broadcast_queue, resized)
 
 
 async def _read_camera_stream(cap):
@@ -109,11 +113,10 @@ def _should_trigger_alert() -> bool:
 
 def _trigger_bear_alert(frame):
     """Save snapshot and push Hatchet event."""
-    global alert_active, last_alert_time
-
+    global alert_active, last_alert_time, last_detection_time
     snapshot_path = _save_snapshot(frame)
 
-    hatchet.event.push(  # TODO: Add metadata, maybe other animals
+    hatchet.event.push(
         "bear:detected",
         {
             "snapshot_path": str(snapshot_path),
@@ -123,6 +126,7 @@ def _trigger_bear_alert(frame):
 
     alert_active = True
     last_alert_time = datetime.now()
+    last_detection_time = datetime.now()
 
 
 def _reset_cooldown_if_needed(bear_found: bool):
@@ -165,11 +169,21 @@ async def detect_bear():
 
 
 async def frame_generator():
-    """Generates JPEG frames for ONE client from broadcast queue"""
+    """Generate MJPEG frames at reduced FPS for streaming."""
+    frame_counter = 0
+    STREAM_INTERVAL = 2  # Send every 2nd frame (15 FPS)
+
     while True:
         frame = await broadcast_queue.get()
+        frame_counter += 1
 
-        _, buffer = cv2.imencode(".jpg", frame)
+        # Only send every 2nd frame to reduce bandwidth
+        if frame_counter % STREAM_INTERVAL != 0:
+            continue
+
+        # Encode with lower quality
+        _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+
         yield (
             b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
         )
@@ -191,7 +205,72 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/video_feed")
 async def video_feed():
+    """Serve MJPEG video stream."""
     return StreamingResponse(
         frame_generator(),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@app.get("/api/status")
+async def get_status():
+    """Return current system status."""
+    if last_detection_time:
+        seconds_ago = int((datetime.now() - last_detection_time).total_seconds())
+        if seconds_ago < 60:
+            time_str = f"{seconds_ago} seconds ago"
+        else:
+            minutes_ago = seconds_ago // 60
+            time_str = f"{minutes_ago} minute{'s' if minutes_ago != 1 else ''} ago"
+
+        return {"last_detection": time_str, "has_detections": True}
+
+    return {"last_detection": "No detections yet", "has_detections": False}
+
+
+# Add landing page endpoint
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    """Serve minimal landing page."""
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Wildlife Detection System</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-light">
+        <div class="container py-4">
+            <div class="text-center mb-4">
+                <h1 class="display-5">Wildlife Detection System</h1>
+                <p class="lead text-muted">Real-time bear monitoring with Hatchet workflows</p>
+            </div>
+
+            <div class="card mb-3">
+                <div class="card-body">
+                    <h5 class="card-title">Detection Status</h5>
+                    <p class="card-text" id="status">Loading...</p>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-body p-0">
+                    <img src="/video_feed" class="w-100" style="max-height: 600px; object-fit: contain;" alt="Live camera feed">
+                </div>
+            </div>
+        </div>
+
+        <script>
+            async function updateStatus() {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                document.getElementById('status').textContent = `Last bear detected: ${data.last_detection}`;
+            }
+            updateStatus();
+            setInterval(updateStatus, 5000); // Update every 5 seconds
+        </script>
+    </body>
+    </html>
+    """
