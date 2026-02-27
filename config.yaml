@@ -1,0 +1,26 @@
+# Wildlife Detection System Configuration
+
+snapshots:
+  directory: "snapshots"
+
+detection:
+  model_dir: "model/yolo11n_openvino_model/"
+  confidence: 0.25
+  interval: 3  # Process every 3rd frame (10 FPS)
+  cooldown_seconds: 60
+
+streaming:
+  urls:
+    - "https://outbound-production.explore.org/stream-production-174/.m3u8"
+    # - "https://outbound-production.explore.org/stream-production-171/.m3u8"
+
+  # Browser streaming settings
+  fps_interval: 2  # Send every 2nd frame (15 FPS)
+  jpeg_quality: 75
+  resolution:
+    width: 640
+    height: 480
+
+queues:
+  frame_queue_size: 1
+  broadcast_queue_size: 100

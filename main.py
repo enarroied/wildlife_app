@@ -1,41 +1,35 @@
 import asyncio
 import random
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import cv2
+from config import load_config
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from hatchet_client import hatchet
 from ultralytics import YOLO
 
-frame_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
-broadcast_queue: asyncio.Queue = asyncio.Queue(maxsize=100)  # For multiple clients
+# Load configuration
+config = load_config()
 
-# TODO: clean this mess, make config files
-SNAPSHOTS_DIR = Path("snapshots")
-COOLDOWN_PERIOD = timedelta(seconds=60)
-model_dir = "model/yolo11n_openvino_model/"
-model = YOLO(model_dir, task="detect")
-DETECTION_INTERVAL = 3  # Process every 3rd frame (10 FPS)
+# Initialize queues with config
+frame_queue = asyncio.Queue(maxsize=config.frame_queue_size)
+broadcast_queue = asyncio.Queue(maxsize=config.broadcast_queue_size)
 
+# Load YOLO model
+model = YOLO(config.model_dir, task="detect")
 
-# Cooldown state
+# Runtime state (these stay as globals)
 alert_active = False
 last_alert_time = None
 last_detection_time = None
 
 
-# TODO: Separate the streaming simulation, add more videos, remove global variable
-URLS = [
-    "https://outbound-production.explore.org/stream-production-174/.m3u8",
-    # "https://outbound-production.explore.org/stream-production-171/.m3u8",
-]
-
-
 @asynccontextmanager
 async def camera(url: str):
+    """Context manager for video capture with cleanup."""
     cap = cv2.VideoCapture(url)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
     try:
@@ -55,7 +49,9 @@ async def _put_frame_nonblocking(queue: asyncio.Queue, frame):
 
 
 async def _distribute_frame(frame):
-    resized = cv2.resize(frame, (640, 480))
+    """Send frame to all consumers (detector and streaming clients)."""
+    # Resize frame to reduce memory and bandwidth
+    resized = cv2.resize(frame, config.stream_resolution)
 
     await _put_frame_nonblocking(frame_queue, resized)
     await _put_frame_nonblocking(broadcast_queue, resized)
@@ -73,28 +69,27 @@ async def _read_camera_stream(cap):
         await asyncio.sleep(0)
 
 
-async def read_camera(urls: list[str]):
+async def read_camera():
     """Continuously read frames from camera sources and distribute to consumers."""
     while True:
-        url = random.choice(urls)
+        url = random.choice(config.stream_urls)
 
         async with camera(url) as cap:
             await _read_camera_stream(cap)
 
 
-def _save_snapshot(frame):
-    """Helper function to save frame as snapshot"""
+def _save_snapshot(frame) -> Path:
+    """Save detection frame as JPEG with timestamp."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    filename = SNAPSHOTS_DIR / f"bear_{timestamp}.jpg"
+    filename = config.snapshots_dir / f"bear_{timestamp}.jpg"
     cv2.imwrite(str(filename), frame)
-    print(f"🐻 BEAR DETECTED! Saved to {filename}")
+    print(f"BEAR DETECTED! Saved to {filename}")
     return filename
 
 
-# Refactored helper functions
 def _detect_bears(frame) -> bool:
     """Run YOLO detection and return True if bear found."""
-    results = model(frame, stream=True, conf=0.25)
+    results = model(frame, stream=True, conf=config.detection_confidence)
 
     for r in results:
         for box in r.boxes:
@@ -114,6 +109,7 @@ def _should_trigger_alert() -> bool:
 def _trigger_bear_alert(frame):
     """Save snapshot and push Hatchet event."""
     global alert_active, last_alert_time, last_detection_time
+
     snapshot_path = _save_snapshot(frame)
 
     hatchet.event.push(
@@ -141,7 +137,7 @@ def _reset_cooldown_if_needed(bear_found: bool):
         return
 
     time_since_alert = datetime.now() - last_alert_time
-    if time_since_alert > COOLDOWN_PERIOD:
+    if time_since_alert > config.cooldown_period:
         alert_active = False
 
 
@@ -153,8 +149,8 @@ async def detect_bear():
         frame = await frame_queue.get()
         frame_counter += 1
 
-        # Only detect every 3rd frame (10 FPS optimization)
-        if frame_counter % DETECTION_INTERVAL != 0:
+        # Only detect every Nth frame (configured interval)
+        if frame_counter % config.detection_interval != 0:
             await asyncio.sleep(0)
             continue
 
@@ -171,18 +167,19 @@ async def detect_bear():
 async def frame_generator():
     """Generate MJPEG frames at reduced FPS for streaming."""
     frame_counter = 0
-    STREAM_INTERVAL = 2  # Send every 2nd frame (15 FPS)
 
     while True:
         frame = await broadcast_queue.get()
         frame_counter += 1
 
-        # Only send every 2nd frame to reduce bandwidth
-        if frame_counter % STREAM_INTERVAL != 0:
+        # Only send every Nth frame to reduce bandwidth
+        if frame_counter % config.stream_fps_interval != 0:
             continue
 
-        # Encode with lower quality
-        _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        # Encode with configured quality
+        _, buffer = cv2.imencode(
+            ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, config.stream_jpeg_quality]
+        )
 
         yield (
             b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
@@ -193,7 +190,8 @@ async def frame_generator():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    camera_task = asyncio.create_task(read_camera(URLS))
+    """Manage background tasks during application lifecycle."""
+    camera_task = asyncio.create_task(read_camera())
     detector_task = asyncio.create_task(detect_bear())
     yield
     camera_task.cancel()
@@ -201,15 +199,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-
-
-@app.get("/video_feed")
-async def video_feed():
-    """Serve MJPEG video stream."""
-    return StreamingResponse(
-        frame_generator(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-    )
 
 
 @app.get("/api/status")
@@ -228,49 +217,16 @@ async def get_status():
     return {"last_detection": "No detections yet", "has_detections": False}
 
 
-# Add landing page endpoint
-@app.get("/", response_class=HTMLResponse)
+@app.get("/video_feed")
+async def video_feed():
+    """Serve MJPEG video stream."""
+    return StreamingResponse(
+        frame_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/", response_class=FileResponse)
 async def dashboard():
-    """Serve minimal landing page."""
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Wildlife Detection System</title>
-        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    </head>
-    <body class="bg-light">
-        <div class="container py-4">
-            <div class="text-center mb-4">
-                <h1 class="display-5">Wildlife Detection System</h1>
-                <p class="lead text-muted">Real-time bear monitoring with Hatchet workflows</p>
-            </div>
-
-            <div class="card mb-3">
-                <div class="card-body">
-                    <h5 class="card-title">Detection Status</h5>
-                    <p class="card-text" id="status">Loading...</p>
-                </div>
-            </div>
-
-            <div class="card">
-                <div class="card-body p-0">
-                    <img src="/video_feed" class="w-100" style="max-height: 600px; object-fit: contain;" alt="Live camera feed">
-                </div>
-            </div>
-        </div>
-
-        <script>
-            async function updateStatus() {
-                const response = await fetch('/api/status');
-                const data = await response.json();
-                document.getElementById('status').textContent = `Last bear detected: ${data.last_detection}`;
-            }
-            updateStatus();
-            setInterval(updateStatus, 5000); // Update every 5 seconds
-        </script>
-    </body>
-    </html>
-    """
+    """Serve landing page."""
+    return FileResponse("templates/index.html")
