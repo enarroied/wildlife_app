@@ -6,9 +6,9 @@ from pathlib import Path
 
 import cv2
 from config import load_config
+from events import push_bear_detected
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, StreamingResponse
-from hatchet_client import hatchet
 from ultralytics import YOLO
 
 # Load configuration
@@ -112,13 +112,7 @@ def _trigger_bear_alert(frame):
 
     snapshot_path = _save_snapshot(frame)
 
-    hatchet.event.push(
-        "bear:detected",
-        {
-            "snapshot_path": str(snapshot_path),
-            "timestamp": datetime.now().isoformat(),
-        },
-    )
+    push_bear_detected(snapshot_path)
 
     alert_active = True
     last_alert_time = datetime.now()

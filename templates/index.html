@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Wildlife Detection System</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+    <div class="container py-4">
+        <div class="text-center mb-4">
+            <h1 class="display-5">Wildlife Detection System</h1>
+            <p class="lead text-muted">Real-time bear monitoring with Hatchet workflows</p>
+        </div>
+
+        <div class="card mb-3">
+            <div class="card-body">
+                <h5 class="card-title">Detection Status</h5>
+                <p class="card-text" id="status">Loading...</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-body p-0">
+                <img src="/video_feed" class="w-100" style="max-height: 600px; object-fit: contain;" alt="Live camera feed">
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function updateStatus() {
+            const response = await fetch('/api/status');
+            const data = await response.json();
+            document.getElementById('status').textContent = `Last bear detected: ${data.last_detection}`;
+        }
+        updateStatus();
+        setInterval(updateStatus, 5000);
+    </script>
+</body>
+</html>
