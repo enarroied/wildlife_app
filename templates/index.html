@@ -5,6 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Wildlife Detection System</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        #manual-alert-btn {
+            transition: transform 0.1s ease;
+        }
+        #manual-alert-btn:active {
+            transform: scale(0.96);
+        }
+        #alert-feedback {
+            min-height: 1.5rem;
+            font-size: 0.875rem;
+        }
+    </style>
 </head>
 <body class="bg-light">
     <div class="container py-4">
@@ -13,16 +25,41 @@
             <p class="lead text-muted">Real-time bear monitoring with Hatchet workflows</p>
         </div>
 
+        <!-- Detection status -->
         <div class="card mb-3">
             <div class="card-body">
                 <h5 class="card-title">Detection Status</h5>
-                <p class="card-text" id="status">Loading...</p>
+                <p class="card-text mb-0" id="status">Loading...</p>
             </div>
         </div>
 
+        <!-- Manual alert -->
+        <div class="card mb-3">
+            <div class="card-body">
+                <h5 class="card-title">Manual Bear Sighting</h5>
+                <p class="card-text text-muted mb-3">
+                    Spotted a bear yourself? Hit the button to trigger an alert immediately.
+                </p>
+                <button
+                    id="manual-alert-btn"
+                    class="btn btn-danger btn-lg w-100 fw-semibold"
+                    onclick="triggerManualAlert()"
+                >
+                    🐻 Report Bear Sighting
+                </button>
+                <p class="mt-2 text-center text-muted" id="alert-feedback"></p>
+            </div>
+        </div>
+
+        <!-- Live feed -->
         <div class="card">
             <div class="card-body p-0">
-                <img src="/video_feed" class="w-100" style="max-height: 600px; object-fit: contain;" alt="Live camera feed">
+                <img
+                    src="/video_feed"
+                    class="w-100"
+                    style="max-height: 600px; object-fit: contain;"
+                    alt="Live camera feed"
+                >
             </div>
         </div>
     </div>
@@ -31,8 +68,47 @@
         async function updateStatus() {
             const response = await fetch('/api/status');
             const data = await response.json();
-            document.getElementById('status').textContent = `Last bear detected: ${data.last_detection}`;
+            document.getElementById('status').textContent =
+                `Last bear detected: ${data.last_detection}`;
         }
+
+        async function triggerManualAlert() {
+            const btn = document.getElementById('manual-alert-btn');
+            const feedback = document.getElementById('alert-feedback');
+
+            btn.disabled = true;
+            btn.textContent = '📡 Sending alert...';
+
+            try {
+                const response = await fetch('/api/manual_alert', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ location: null }),
+                });
+
+                if (response.ok) {
+                    btn.textContent = '✅ Alert sent!';
+                    btn.classList.replace('btn-danger', 'btn-success');
+                    feedback.textContent = 'Hatchet workflow triggered successfully.';
+                } else {
+                    throw new Error('Request failed');
+                }
+            } catch (err) {
+                btn.textContent = '❌ Failed — try again';
+                btn.classList.replace('btn-danger', 'btn-warning');
+                feedback.textContent = 'Could not reach the server.';
+            }
+
+            // Reset button after 3 seconds
+            setTimeout(() => {
+                btn.disabled = false;
+                btn.textContent = '🐻 Report Bear Sighting';
+                btn.classList.replace('btn-success', 'btn-danger');
+                btn.classList.replace('btn-warning', 'btn-danger');
+                feedback.textContent = '';
+            }, 3000);
+        }
+
         updateStatus();
         setInterval(updateStatus, 5000);
     </script>
